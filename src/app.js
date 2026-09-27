@@ -16,6 +16,11 @@ import {
   MAX_BODY_BASE64_LENGTH,
   MAX_CONTENT_TYPE_LENGTH,
 } from './multipart-check.js';
+import {
+  assembleResponse,
+  MAX_FRAGMENTS,
+  MAX_FRAGMENT_BASE64_LENGTH,
+} from './assemble.js';
 import { ENTITY_TAG_RE, parseHttpDate } from './conditional.js';
 
 const MEDIA_TYPE_RE =
@@ -85,6 +90,32 @@ const multipartCheckBodySchema = {
   },
 };
 
+const fragmentSchema = {
+  type: 'object',
+  required: ['start', 'dataBase64'],
+  additionalProperties: false,
+  properties: {
+    start: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    // The smallest canonical base64 quantum (one byte) is 4 characters.
+    dataBase64: { type: 'string', minLength: 4, maxLength: MAX_FRAGMENT_BASE64_LENGTH },
+  },
+};
+
+const assembleBodySchema = {
+  type: 'object',
+  required: ['size', 'fragments'],
+  additionalProperties: false,
+  properties: {
+    size: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    contentType: { type: 'string', minLength: 1, maxLength: 255 },
+    fragments: {
+      type: 'array',
+      maxItems: MAX_FRAGMENTS,
+      items: fragmentSchema,
+    },
+  },
+};
+
 // Resume planning demands strict types: Fastify's default ajv setup coerces
 // scalar types and silently strips unknown properties, which would let a
 // string like "1000" pass as a byte count. This route therefore validates
@@ -104,8 +135,9 @@ export function buildApp(config = {}) {
   const app = Fastify({
     logger: config.logger ?? false,
     trustProxy: true,
-    // The largest JSON body /multipart-check accepts is roughly 1.4 MiB of
-    // base64; keep the framework ceiling above the 1 MiB decoded-message rule.
+    // The largest JSON body /multipart-check and /assemble-response accept is
+    // roughly 1.4 MiB of base64; keep the framework ceiling above the 1 MiB
+    // decoded-message rule.
     bodyLimit: 2 * 1024 * 1024,
   });
 
@@ -187,6 +219,35 @@ export function buildApp(config = {}) {
     },
     async (request, reply) => {
       const result = checkMultipartMessage(request.body);
+      return reply.status(result.statusCode).send(result);
+    },
+  );
+
+  // Assemble the raw wire body of a range response from the client's sparse
+  // fragment cache; Range is carried as a header exactly as on /plan.
+  app.post(
+    '/assemble-response',
+    {
+      schema: { body: assembleBodySchema },
+      validatorCompiler: strictBodyValidatorCompiler,
+    },
+    async (request, reply) => {
+      const rangeError = checkRangeHeader(request);
+      if (rangeError) return reply.status(400).send(rangeError);
+
+      if (request.body.contentType !== undefined && !MEDIA_TYPE_RE.test(request.body.contentType)) {
+        return reply.status(400).send(invalidContentType());
+      }
+
+      const result = assembleResponse({
+        size: request.body.size,
+        contentType: request.body.contentType,
+        rangeHeader: request.headers.range,
+        fragments: request.body.fragments,
+        maxSegments,
+        transferSizeRatio,
+      });
+
       return reply.status(result.statusCode).send(result);
     },
   );

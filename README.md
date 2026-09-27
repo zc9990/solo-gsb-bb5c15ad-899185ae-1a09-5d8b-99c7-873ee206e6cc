@@ -13,6 +13,11 @@ API，遵循 [RFC 9110 §14](https://www.rfc-editor.org/rfc/rfc9110.html#section
 `POST /multipart-check` 则用于**核验**真实的 `multipart/byteranges` 响应
 报文：传入资源大小、期望区间与原始报文，返回实收、缺失、预期外的字节区间。
 
+`POST /assemble-response` 走向相反方向：客户端上报稀疏缓存片段（`Range`
+请求头 + JSON 内的 `fragments`），服务复用 `/plan` 的归并与限额规则选中
+区间，校验缓存一致性与覆盖度后**装配出原始响应体**（单段或
+`multipart/byteranges`），以 base64 连同状态码、响应头一并返回（见下文）。
+
 ## 单条启动命令
 
 ```bash
@@ -264,6 +269,114 @@ PY
 }
 ```
 
+### `POST /assemble-response`（稀疏缓存装配响应体）
+
+面向“客户端已缓存部分字节”的场景：客户端以 `Range` 请求头声明想要的
+区间（与 `/plan` 完全一致），并在 JSON 体内提交稀疏缓存片段；服务复用
+`/plan` 的区间解析、归并与限额规则算出选中区间，先校验缓存本身的一致
+性，再检查覆盖度，最后装配出源站应返回的**原始响应体**——单段时为该段
+字节本身，多段时为规范封装的 `multipart/byteranges` 报文（边界与 `/plan`
+对同一请求给出的完全一致）。
+
+请求体：
+
+| 字段          | 类型    | 必填 | 说明                                                         |
+| ------------- | ------- | ---- | ------------------------------------------------------------ |
+| `size`        | integer | 是   | 资源总字节数，非负安全整数（≥ 0）                             |
+| `contentType` | string  | 否   | 资源媒体类型，默认 `application/octet-stream`                |
+| `fragments`   | array   | 是   | 缓存片段数组（≤ 1024 项），每项 `{"start":…,"dataBase64":…}`：`start` 为片段首字节偏移（非负安全整数），`dataBase64` 为自该位置起连续字节的标准 base64（含规范 `=` 填充，至少 1 字节）；片段可乱序、重叠或相邻 |
+
+处理顺序与规则：
+
+1. **片段校验（400）**：base64 必须规范（`INVALID_FRAGMENT_BASE64`）；每段
+   须满足 `start + 字节数 − 1 < size`（`FRAGMENT_OUT_OF_BOUNDS`）；全部片段
+   解码后合计 **≤ 1 MiB**（`FRAGMENTS_TOO_LARGE`）。
+2. **区间规划**：与 `/plan` 完全相同的解析、夹取、归并与限额——`416`
+   （不可满足）、`422 TOO_MANY_SEGMENTS` / `TRANSFER_LIMIT_EXCEEDED`
+   原样返回，不涉及缓存内容。
+3. **输出限额（422）**：装配后的响应体（含 multipart 封装字节）超过
+   **1 MiB** 时返回 `ASSEMBLED_BODY_TOO_LARGE`。
+4. **冲突检测（409）**：重叠位置字节不一致时返回 `FRAGMENT_CONFLICT`，
+   `conflicts` 按起点升序列出所有不一致的归并区间（仅含真正不同的位置）。
+5. **覆盖检查（409）**：选中区间未被缓存完全覆盖时返回
+   `FRAGMENT_COVERAGE_INCOMPLETE`，`missing` 按起点升序列出缺失区间。
+6. **装配（206）**：按规划顺序（即 `/plan` 的段顺序，可跨片段取数）拼装；
+   响应在 `/plan` 的 206 结果之上增加 `bodyBytes` 与 `bodyBase64`，
+   `responseHeaders['Content-Length']` 恒等于 `bodyBase64` 解码后的字节数。
+
+单段示例（缓存 `[0,9]` 为 10 个 `a`，请求 `bytes=0-9`）：
+
+```bash
+curl -X POST http://localhost:3000/assemble-response \
+  -H 'Content-Type: application/json' \
+  -H 'Range: bytes=0-9' \
+  -d '{"size":1000,"fragments":[{"start":0,"dataBase64":"YWFhYWFhYWFhYQ=="}]}'
+```
+
+响应（节选）：
+
+```json
+{
+  "statusCode": 206,
+  "decision": "partial",
+  "segmentsCount": 1,
+  "bytes": { "selected": 10, "framing": 0, "total": 10, "resource": 1000, "ratio": 0.01 },
+  "multipart": null,
+  "responseHeaders": {
+    "Accept-Ranges": "bytes",
+    "Content-Type": "application/octet-stream",
+    "Content-Range": "bytes 0-9/1000",
+    "Content-Length": "10"
+  },
+  "bodyBytes": 10,
+  "bodyBase64": "YWFhYWFhYWFhYQ=="
+}
+```
+
+多段示例（缓存分两片，装配出的报文可直接交给 `/multipart-check` 核验）：
+
+```bash
+python3 - <<'PY'
+import base64, json, urllib.request
+data = bytes(i % 256 for i in range(1000))  # 实际场景为客户端缓存的字节
+payload = {
+    "size": 1000,
+    "contentType": "video/mp4",
+    "fragments": [
+        {"start": 0,  "dataBase64": base64.b64encode(data[:50]).decode()},
+        {"start": 50, "dataBase64": base64.b64encode(data[50:]).decode()},
+    ],
+}
+req = urllib.request.Request("http://localhost:3000/assemble-response",
+                             data=json.dumps(payload).encode(),
+                             headers={"Content-Type": "application/json",
+                                      "Range": "bytes=0-9, 990-999"})
+res = json.load(urllib.request.urlopen(req))
+body = base64.b64decode(res["bodyBase64"])
+assert len(body) == int(res["responseHeaders"]["Content-Length"])
+print(res["statusCode"], res["responseHeaders"]["Content-Type"])
+PY
+```
+
+冲突与空洞示例：
+
+```bash
+# 冲突：片段 [0,5] 为 "aaaaaa"，片段 [4,9] 为 "bbbbbb"，[4,5] 字节不一致 -> 409
+curl -X POST http://localhost:3000/assemble-response \
+  -H 'Content-Type: application/json' \
+  -H 'Range: bytes=0-9' \
+  -d '{"size":1000,"fragments":[{"start":0,"dataBase64":"YWFhYWFh"},{"start":4,"dataBase64":"YmJiYmJi"}]}'
+# {"statusCode":409,"code":"FRAGMENT_CONFLICT",...,"conflicts":[{"start":4,"end":5}]}
+
+# 空洞：缓存只有 [0,29] 与 [60,99]，请求 bytes=0-99 -> 409 并给出缺失区间
+curl -X POST http://localhost:3000/assemble-response \
+  -H 'Content-Type: application/json' \
+  -H 'Range: bytes=0-99' \
+  -d '{"size":1000,"fragments":[{"start":0,"dataBase64":"YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh"},{"start":60,"dataBase64":"YmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYg=="}]}'
+# {"statusCode":409,"code":"FRAGMENT_COVERAGE_INCOMPLETE",...,"missing":[{"start":30,"end":59}]}
+```
+
+
 ## 响应语义
 
 每个规划结果带 `decision` 字段：
@@ -385,7 +498,8 @@ src/
   planner.js        # 范围规划核心：解析、夹取、丢弃、合并、边界生成、422 守卫、条件降级
   resume.js         # 断点续传缺口规划：区间归并、缺口计算、按 chunkBytes/limit 拆分
   multipart-check.js # multipart/byteranges 报文核验：boundary 解析、严格分段、Content-Range 核算、区间归并/差集
-  app.js            # Fastify 应用：POST/GET /plan、POST /resume-plan、POST /multipart-check、/healthz、输入校验
+  assemble.js       # 稀疏缓存装配：片段/base64 校验、冲突扫描、覆盖检查、单段与 multipart 响应体生成
+  app.js            # Fastify 应用：POST/GET /plan、POST /resume-plan、POST /multipart-check、POST /assemble-response、/healthz、输入校验
   server.js         # 启动入口与环境变量读取
 test/
   planner.test.js       # 原有 node:test 用例（26 个）
@@ -393,13 +507,14 @@ test/
   headers.test.js       # 真实 socket 上的重复头与 CR/LF 拒绝用例（4 个）
   resume.test.js        # 断点续传缺口规划用例（24 个）
   multipart-check.test.js # multipart/byteranges 核验用例（32 个）
+  assemble.test.js      # 稀疏缓存装配用例（29 个）
 ```
 
 ## 本地开发与测试
 
 ```bash
 npm ci
-npm test          # 120 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 续传缺口规划 + multipart 核验
+npm test          # 149 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 续传缺口规划 + multipart 核验 + 稀疏缓存装配
 npm start
 ```
 
@@ -426,3 +541,8 @@ npm start
   字母数字或连字符、不允许 CR/LF，杜绝边界注入；报文必须 CRLF 分隔、无前言
   尾声、闭合边界，段头仅接受合法 token 字段名与字段值，Content-Range 唯一、
   总大小与 `size` 一致、段数据长度与声明一致；数据中的伪边界序列不会截断分段。
+- `/assemble-response` 复用同一严格校验器与 `Range` 头检查（拒绝重复头、
+  缺失返回 `400`）：`fragments` 上限 1024 项，每项必须落在资源内且为规范
+  base64；解码后的缓存总量与装配出的响应体各不得超过 1 MiB，防止超大输入
+  或输出耗尽内存；重叠片段逐字节比对，冲突与覆盖空洞分别以 `409` 报出，
+  不会用矛盾数据装配响应。
