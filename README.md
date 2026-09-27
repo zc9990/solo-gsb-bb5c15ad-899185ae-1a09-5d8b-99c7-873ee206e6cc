@@ -13,6 +13,11 @@ API，遵循 [RFC 9110 §14](https://www.rfc-editor.org/rfc/rfc9110.html#section
 `POST /multipart-check` 则用于**核验**真实的 `multipart/byteranges` 响应
 报文：传入资源大小、期望区间与原始报文，返回实收、缺失、预期外的字节区间。
 
+`POST /assemble-response` 走相反方向：客户端提交 `Range` 请求头与稀疏缓存
+片段（各含起始偏移与 base64 字节），服务复用 `/plan` 的规划规则算出选中
+区间，校验片段一致性与覆盖完整性后，**只从缓存字节**拼出源站应有的原始
+响应体（单段或 `multipart/byteranges`），连同状态码与响应头一并返回。
+
 ## 单条启动命令
 
 ```bash
@@ -264,6 +269,106 @@ PY
 }
 ```
 
+### `POST /assemble-response`（稀疏缓存拼装响应）
+
+客户端持有资源的**稀疏缓存字节**（如断点续传留下的分片），以真实 `Range`
+请求头（与 `/plan` 完全一致，必填、拒绝重复头）加 JSON 体提交缓存片段。
+服务复用 `/plan` 的区间归并与限额规则（解析、夹取、合并、段数/传输字节
+守卫）算出选中区间，再依次校验片段、检查重叠冲突与覆盖空洞，全部通过后
+**只从缓存字节**拼出源站应有的原始响应体并 base64 返回。本接口不评估
+`If-Range`。
+
+请求体：
+
+| 字段          | 类型    | 必填 | 说明                                                         |
+| ------------- | ------- | ---- | ------------------------------------------------------------ |
+| `size`        | integer | 是   | 资源总字节数，非负安全整数（≥ 0）                             |
+| `contentType` | string  | 否   | 资源媒体类型，默认 `application/octet-stream`                |
+| `fragments`   | array   | 是   | 缓存片段数组（≤ 1024 项），每项 `{"start":…,"dataBase64":…}`：`start` 为片段起始偏移（非负安全整数），`dataBase64` 为自该偏移起的连续字节（标准 base64、规范 `=` 填充，解码后 ≥ 1 字节） |
+
+处理顺序与失败语义：
+
+1. **片段校验（400）**：每个片段必须完整落在资源内（`start + 字节数 ≤ size`），
+   base64 必须规范；全部片段解码后合计 **≤ 1 MiB**。错误码：
+   `INVALID_FRAGMENT`、`INVALID_FRAGMENT_BASE64`、`FRAGMENT_OUT_OF_BOUNDS`、
+   `FRAGMENTS_TOO_LARGE`、`TOO_MANY_FRAGMENTS`。
+2. **区间规划**：规则与 `/plan` 完全相同；`400`（Range 缺失/语法/单位）、
+   `416`（不可满足）、`422`（`TOO_MANY_SEGMENTS` / `TRANSFER_LIMIT_EXCEEDED`）
+   结果原样透传。
+3. **重叠冲突（409）**：片段重叠位置的字节必须一致，否则返回
+   `FRAGMENT_CONFLICT` 与 `conflicts`——归并后的冲突区间（相邻差异合并为一
+   段）；即使冲突落在选中区间之外也照样失败。
+4. **覆盖检查（409）**：选中区间存在缓存空洞时返回 `INCOMPLETE_COVERAGE`
+   与 `missing`——缺失区间（归并后按起点升序）。
+5. **拼装（206）**：按规划顺序从可跨片段的缓存取数。单段时响应体即该段原始
+   字节；多段时生成规范 `multipart/byteranges` 报文（与 `/plan` 相同的确定性
+   边界，封装格式正是 `/multipart-check` 接受的形式，可互相验证）。拼装后的
+   响应体同样 **≤ 1 MiB**，超出返回 `422 ASSEMBLED_TOO_LARGE`。
+
+响应（`206`）在 `/plan` 规划结果的基础上增加两个字段：
+
+| 字段         | 说明                                                         |
+| ------------ | ------------------------------------------------------------ |
+| `bodyBase64` | 拼装出的原始响应体（标准 base64）：单段字节或完整 multipart 报文 |
+| `bodyBytes`  | 解码后的体长度；`responseHeaders['Content-Length']` 恒等于它  |
+
+示例：
+
+```bash
+# 单区间：缓存 [0,9]（10 个 'a'），请求 bytes=0-9 -> 206，bodyBase64 即这 10 字节
+curl -X POST http://localhost:3000/assemble-response \
+  -H 'Content-Type: application/json' \
+  -H 'Range: bytes=0-9' \
+  -d '{"size":1000,"contentType":"video/mp4","fragments":[{"start":0,"dataBase64":"YWFhYWFhYWFhYQ=="}]}'
+
+# 多区间：缓存 [0,9] 与 [100,109] -> 206 multipart/byteranges 原始报文
+curl -X POST http://localhost:3000/assemble-response \
+  -H 'Content-Type: application/json' \
+  -H 'Range: bytes=0-9, 100-109' \
+  -d '{"size":1000,"fragments":[{"start":0,"dataBase64":"YWFhYWFhYWFhYQ=="},{"start":100,"dataBase64":"YmJiYmJiYmJiYg=="}]}'
+
+# 重叠冲突：两片在 [5,9] 字节不一致 -> 409
+curl -X POST http://localhost:3000/assemble-response \
+  -H 'Content-Type: application/json' \
+  -H 'Range: bytes=0-9' \
+  -d '{"size":1000,"fragments":[{"start":0,"dataBase64":"YWFhYWFhYWFhYQ=="},{"start":5,"dataBase64":"WFhYWFg="}]}'
+# {"statusCode":409,"code":"FRAGMENT_CONFLICT","error":"Conflict",
+#  "message":"overlapping fragments carry different bytes in 1 interval",
+#  "conflicts":[{"start":5,"end":9}]}
+
+# 覆盖空洞：缓存只覆盖 [0,4] 与 [10,14] -> 409
+curl -X POST http://localhost:3000/assemble-response \
+  -H 'Content-Type: application/json' \
+  -H 'Range: bytes=0-14' \
+  -d '{"size":1000,"fragments":[{"start":0,"dataBase64":"YWFhYWE="},{"start":10,"dataBase64":"YmJiYmI="}]}'
+# {"statusCode":409,"code":"INCOMPLETE_COVERAGE","error":"Conflict",
+#  "message":"cached fragments leave 1 hole in the selected ranges",
+#  "missing":[{"start":5,"end":9}]}
+```
+
+单区间 206 响应示例（节选）：
+
+```json
+{
+  "statusCode": 206,
+  "decision": "partial",
+  "segmentsCount": 1,
+  "responseHeaders": {
+    "Accept-Ranges": "bytes",
+    "Content-Type": "video/mp4",
+    "Content-Range": "bytes 0-9/1000",
+    "Content-Length": "10"
+  },
+  "bodyBytes": 10,
+  "bodyBase64": "YWFhYWFhYWFhYQ=="
+}
+```
+
+多区间时 `multipart` 字段给出确定性边界，`bodyBase64` 解码后即为完整
+`multipart/byteranges` 报文（`--boundary` CRLF 段头 CRLF 数据 CRLF …
+`--boundary--` CRLF），段顺序与规划顺序一致（保持各区间首次出现的顺序，
+不一定是偏移升序）。
+
 ## 响应语义
 
 每个规划结果带 `decision` 字段：
@@ -385,7 +490,8 @@ src/
   planner.js        # 范围规划核心：解析、夹取、丢弃、合并、边界生成、422 守卫、条件降级
   resume.js         # 断点续传缺口规划：区间归并、缺口计算、按 chunkBytes/limit 拆分
   multipart-check.js # multipart/byteranges 报文核验：boundary 解析、严格分段、Content-Range 核算、区间归并/差集
-  app.js            # Fastify 应用：POST/GET /plan、POST /resume-plan、POST /multipart-check、/healthz、输入校验
+  assemble.js       # 稀疏缓存拼装：片段校验、重叠冲突检测、覆盖核算、单段/multipart 报文生成
+  app.js            # Fastify 应用：POST/GET /plan、POST /resume-plan、POST /multipart-check、POST /assemble-response、/healthz、输入校验
   server.js         # 启动入口与环境变量读取
 test/
   planner.test.js       # 原有 node:test 用例（26 个）
@@ -393,13 +499,14 @@ test/
   headers.test.js       # 真实 socket 上的重复头与 CR/LF 拒绝用例（4 个）
   resume.test.js        # 断点续传缺口规划用例（24 个）
   multipart-check.test.js # multipart/byteranges 核验用例（32 个）
+  assemble.test.js      # 稀疏缓存拼装用例（31 个）
 ```
 
 ## 本地开发与测试
 
 ```bash
 npm ci
-npm test          # 120 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 续传缺口规划 + multipart 核验
+npm test          # 151 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 续传缺口规划 + multipart 核验 + 稀疏缓存拼装
 npm start
 ```
 
@@ -426,3 +533,10 @@ npm start
   字母数字或连字符、不允许 CR/LF，杜绝边界注入；报文必须 CRLF 分隔、无前言
   尾声、闭合边界，段头仅接受合法 token 字段名与字段值，Content-Range 唯一、
   总大小与 `size` 一致、段数据长度与声明一致；数据中的伪边界序列不会截断分段。
+- `/assemble-response` 同样使用严格校验器：`fragments` 上限 1024 项，每项的
+  `start` 必须是非负安全整数、`dataBase64` 必须是规范标准 base64；片段必须
+  完整落在资源内，解码后合计不超过 1 MiB，拼装出的响应体也不超过 1 MiB
+  （超出分别返回 `400 FRAGMENTS_TOO_LARGE` / `422 ASSEMBLED_TOO_LARGE`）；
+  重叠片段字节不一致（`409 FRAGMENT_CONFLICT`）或覆盖不完整
+  （`409 INCOMPLETE_COVERAGE`）时不会生成任何响应体；`contentType` 沿用
+  `/plan` 的媒体类型与 CR/LF 检查，杜绝响应头注入。
